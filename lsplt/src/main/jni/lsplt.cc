@@ -382,6 +382,19 @@ inline namespace v2 {
     return hook_info.DoHook(register_info);
 }
 
+[[maybe_unused]] bool ReleaseInactiveCache() {
+    const std::unique_lock lock(hook_mutex);
+    if (!register_info.empty()) return false;
+    for (const auto &[address, info] : hook_info) {
+        if (info.backup || !info.hooks.empty()) return false;
+    }
+    hook_info.clear();
+    std::vector<RegisterInfo>().swap(register_info);
+    std::vector<MapInfo>().swap(map_cache);
+    map_cache_ready = false;
+    return true;
+}
+
 [[gnu::destructor]] [[maybe_unused]] bool InvalidateBackup() {
     const std::unique_lock lock(hook_mutex);
     return hook_info.InvalidateBackup();

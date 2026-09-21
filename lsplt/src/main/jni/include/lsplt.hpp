@@ -124,6 +124,9 @@ struct MapInfo {
 /// match the state inherited from its parent.
 [[maybe_unused, gnu::visibility("default")]] bool CommitHookCached();
 
+/// Release cached state only after all hooks and backup mappings are gone.
+[[maybe_unused, gnu::visibility("default")]] bool ReleaseInactiveCache();
+
 /// \brief Invalidate backup memory regions
 /// Normally LSPlt will backup the hooked memory region and do hook on a copied anonymous memory
 /// region, and restore the original memory region when the hook is unregistered
