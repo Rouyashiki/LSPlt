@@ -3,7 +3,9 @@
 #include <sys/mman.h>
 #include <sys/sysmacros.h>
 
+#include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cinttypes>
 #include <map>
 #include <mutex>
@@ -123,50 +125,6 @@ public:
         }
     }
 
-    bool DoHookInPlace(uintptr_t addr, uintptr_t callback, uintptr_t *backup) {
-        static_assert(__atomic_always_lock_free(sizeof(uintptr_t), nullptr));
-        auto iter = lower_bound(addr);
-        if (iter == end() || addr % alignof(uintptr_t) != 0 ||
-            addr < iter->second.start || addr >= iter->second.end ||
-            iter->second.end - addr < sizeof(uintptr_t)) {
-            errno = EINVAL;
-            LOGE("Invalid PLT slot: %d", errno);
-            return false;
-        }
-        auto &info = iter->second;
-        auto *slot = reinterpret_cast<uintptr_t *>(addr);
-        const auto previous = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
-        auto record = info.hooks.find(addr);
-        if (previous == callback && record == info.hooks.end()) return true;
-        const bool inserted = record == info.hooks.end();
-        if (inserted) record = info.hooks.emplace(addr, previous).first;
-        const bool protect = !(info.perms & PROT_WRITE);
-        if (protect && sys_mprotect(PageStart(addr), kPageSize, info.perms | PROT_WRITE) != 0) {
-            if (inserted) info.hooks.erase(record);
-            LOGE("Making PLT page writable: %d", errno);
-            return false;
-        }
-
-        if (previous != callback) {
-            // A callback can run as soon as its slot is published.
-            if (backup) *backup = previous;
-            __atomic_store_n(slot, callback, __ATOMIC_RELEASE);
-        }
-        if (protect && sys_mprotect(PageStart(addr), kPageSize, info.perms) != 0) {
-            const int error = errno;
-            __atomic_store_n(slot, previous, __ATOMIC_RELEASE);
-            if (sys_mprotect(PageStart(addr), kPageSize, info.perms) == 0) {
-                if (inserted) info.hooks.erase(record);
-            }
-            // Keep the record on a failed rollback so cleanup can retry protection.
-            errno = error;
-            LOGE("Restoring PLT page protection: %d", errno);
-            return false;
-        }
-        if (record->second == callback) info.hooks.erase(record);
-        return true;
-    }
-
     bool DoHook(uintptr_t addr, uintptr_t callback, uintptr_t *backup) {
         LOGV("Hooking %p", reinterpret_cast<void *>(addr));
         auto iter = lower_bound(addr);
@@ -240,37 +198,6 @@ public:
         return true;
     }
 
-    bool DoHook(std::vector<RegisterInfo> &register_info) {
-        bool res = true;
-        // Preserve unprocessed registrations if a later hook throws.
-        while (!register_info.empty()) {
-            const auto &reg = register_info.front();
-            bool found = false;
-            bool committed = true;
-            for (auto info_iter = rbegin(); info_iter != rend(); ++info_iter) {
-                auto &info = info_iter->second;
-                if (info.offset != reg.offset_range.first || !info.Match(reg)) {
-                    continue;
-                }
-                if (!info.elf) info.elf = std::make_unique<Elf>(info.start);
-                if (info.elf && info.elf->Valid()) {
-                    LOGD("Hooking %s", reg.symbol.data());
-                    const auto addresses = info.elf->FindPltAddr(reg.symbol);
-                    for (auto addr : addresses) {
-                        found = true;
-                        committed =
-                            DoHookInPlace(addr, reinterpret_cast<uintptr_t>(reg.callback),
-                                          reinterpret_cast<uintptr_t *>(reg.backup)) &&
-                            committed;
-                    }
-                }
-            }
-            res = found && committed && res;
-            register_info.erase(register_info.begin());
-        }
-        return res;
-    }
-
     bool InvalidateBackup() {
         bool res = true;
         for (auto &[_, info] : *this) {
@@ -315,14 +242,292 @@ public:
 };
 
 std::mutex hook_mutex;
-// Staging buffer for pending hooks, drained by every CommitHook. It holds one or
-// two entries in practice, so contiguity is not the point -- capacity survival is:
-// erasing does not release the buffer, so after the first commit in a process every
-// later register/commit cycle allocates nothing. The std::list it replaced malloc'd
-// a node per registration and freed it per commit, forever, on a path that runs in
-// each forked app process.
+// Pending requests are consumed by the next commit, including blocked requests.
 std::vector<RegisterInfo> register_info;
 HookInfos hook_info;
+
+using lsplt::CommitReport;
+using lsplt::CommitStatus;
+using lsplt::HookError;
+using lsplt::RegistrationResult;
+
+struct Transaction {
+    struct Page {
+        uintptr_t address;
+        int perms;
+        bool writable;
+    };
+    struct Slot {
+        uintptr_t address;
+        uintptr_t before;
+        HookInfo *owner;
+        size_t page;
+        bool published = false;
+    };
+
+    RegisterInfo request;
+    std::vector<Slot> slots;
+    std::vector<Page> pages;
+    std::map<uintptr_t, uintptr_t> new_records;
+    CommitStatus status = CommitStatus::Rejected;
+    HookError error = HookError::None;
+    HookError rollback_error = HookError::None;
+    int error_number = 0;
+    int rollback_error_number = 0;
+    bool ever_published = false;
+    bool observed = true;
+
+    explicit Transaction(const RegisterInfo &reg)
+        : request{reg.dev, reg.inode, reg.offset_range, reg.symbol, reg.callback, nullptr} {}
+
+    void Fail(HookError cause, int number) {
+        if (error == HookError::None) { error = cause; error_number = number; }
+    }
+
+    void RollbackFailure(HookError cause, int number) {
+        if (rollback_error == HookError::None) {
+            rollback_error = cause;
+            rollback_error_number = number;
+        }
+    }
+
+    static bool MappedRange(uintptr_t address, size_t size, const HookInfo &owner) {
+        return std::any_of(map_cache.begin(), map_cache.end(), [&](const auto &map) {
+            return map.is_private && (map.perms & PROT_READ) && !map.path.empty() &&
+                   map.path[0] != '[' && map.dev == owner.dev && map.inode == owner.inode &&
+                   address >= map.start && address < map.end && map.end - address >= size &&
+                   map.offset + address - map.start == owner.offset + address - owner.start;
+        });
+    }
+
+    bool Prepare(bool needs_backup) {
+        static_assert(__atomic_always_lock_free(sizeof(uintptr_t), nullptr));
+        std::vector<uintptr_t> addresses;
+        bool found_mapping = false, valid_elf = false;
+        for (auto &[_, info] : hook_info) {
+            if (info.offset != request.offset_range.first || !info.Match(request)) continue;
+            if (!MappedRange(info.start, sizeof(ElfW(Ehdr)), info)) continue;
+            found_mapping = true;
+            if (!info.elf) info.elf = std::make_unique<Elf>(info.start);
+            if (!info.elf->Valid()) continue;
+            valid_elf = true;
+            auto found = info.elf->FindPltAddr(request.symbol);
+            addresses.insert(addresses.end(), found.begin(), found.end());
+        }
+        if (addresses.empty()) {
+            Fail(!found_mapping ? HookError::MapUnavailable :
+                 !valid_elf ? HookError::InvalidElf : HookError::SymbolNotFound,
+                 !valid_elf && found_mapping ? ENOEXEC : ENOENT);
+            return false;
+        }
+        std::sort(addresses.begin(), addresses.end());
+        addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+        slots.reserve(addresses.size());
+        pages.reserve(addresses.size());
+        for (auto address : addresses) {
+            auto iter = hook_info.lower_bound(address);
+            if (iter == hook_info.end() || address % alignof(uintptr_t) != 0 ||
+                address < iter->second.start || address >= iter->second.end ||
+                iter->second.end - address < sizeof(uintptr_t) ||
+                !iter->second.Match(request) || !iter->second.is_private ||
+                !(iter->second.perms & PROT_READ) ||
+                !MappedRange(address, sizeof(uintptr_t), iter->second)) {
+                Fail(HookError::InvalidSlot, EINVAL);
+                return false;
+            }
+            auto &owner = iter->second;
+            auto page_address = reinterpret_cast<uintptr_t>(PageStart(address));
+            if (pages.empty() || pages.back().address != page_address)
+                pages.push_back({page_address, owner.perms, bool(owner.perms & PROT_WRITE)});
+            auto before = __atomic_load_n(reinterpret_cast<uintptr_t *>(address), __ATOMIC_ACQUIRE);
+            slots.push_back({address, before, &owner, pages.size() - 1});
+        }
+        const auto callback = reinterpret_cast<uintptr_t>(request.callback);
+        if (needs_backup) {
+            const auto original = slots.front().before;
+            if (original == 0 || std::any_of(slots.begin(), slots.end(), [&](const auto &slot) {
+                    return slot.before != original;
+                })) {
+                Fail(HookError::InconsistentOriginal, EINVAL);
+                return false;
+            }
+        }
+        // Allocate every potential hook node before making any page writable.
+        for (const auto &slot : slots) {
+            if (slot.before != callback && !slot.owner->hooks.count(slot.address))
+                new_records.emplace(slot.address, slot.before);
+        }
+        return true;
+    }
+
+    bool RestorePermissions() {
+        bool ok = true;
+        for (auto &page : pages) {
+            if (!page.writable || (page.perms & PROT_WRITE)) continue;
+            if (sys_mprotect(reinterpret_cast<void *>(page.address), kPageSize, page.perms) != 0) {
+                ok = false;
+                RollbackFailure(HookError::ProtectFailed, errno);
+            } else {
+                page.writable = false;
+            }
+        }
+        return ok;
+    }
+
+    bool Rollback(bool recheck_permissions = false) {
+        rollback_error = HookError::None;
+        rollback_error_number = 0;
+        bool ok = true;
+        const auto callback = reinterpret_cast<uintptr_t>(request.callback);
+        for (auto iter = slots.rbegin(); iter != slots.rend(); ++iter) {
+            auto &slot = *iter;
+            if (!slot.published) continue;
+            auto *address = reinterpret_cast<uintptr_t *>(slot.address);
+            auto current = __atomic_load_n(address, __ATOMIC_ACQUIRE);
+            if (current == slot.before) { slot.published = false; continue; }
+            if (current != callback) {
+                RollbackFailure(HookError::SlotConflict, EBUSY);
+                ok = false;
+                continue;
+            }
+            auto &page = pages[slot.page];
+            // A later retry cannot trust permissions retained in the journal.
+            if (recheck_permissions || !page.writable) {
+                if (sys_mprotect(reinterpret_cast<void *>(page.address), kPageSize,
+                                 page.perms | PROT_WRITE) != 0) {
+                    RollbackFailure(HookError::ProtectFailed, errno);
+                    ok = false;
+                    continue;
+                }
+                page.writable = true;
+            }
+            auto expected = callback;
+            if (__atomic_compare_exchange_n(address, &expected, slot.before, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ||
+                expected == slot.before) {
+                slot.published = false;
+            } else {
+                RollbackFailure(HookError::SlotConflict, EBUSY);
+                ok = false;
+            }
+        }
+        ok = RestorePermissions() && ok;
+        status = ok ? CommitStatus::RolledBack : CommitStatus::RollbackIncomplete;
+        return ok;
+    }
+
+    void Execute(void **backup) {
+        const auto callback = reinterpret_cast<uintptr_t>(request.callback);
+        if (std::all_of(slots.begin(), slots.end(), [&](const auto &slot) {
+                return slot.before == callback;
+            })) {
+            for (const auto &slot : slots) {
+                if (__atomic_load_n(reinterpret_cast<uintptr_t *>(slot.address), __ATOMIC_ACQUIRE) != callback) {
+                    Fail(HookError::SlotConflict, EBUSY);
+                    return;
+                }
+            }
+            for (const auto &slot : slots) {
+                auto record = slot.owner->hooks.find(slot.address);
+                if (record != slot.owner->hooks.end() && record->second == callback)
+                    slot.owner->hooks.erase(record);
+            }
+            status = CommitStatus::NoChange;
+            return;
+        }
+        for (auto &page : pages) {
+            if (page.writable) continue;
+            if (sys_mprotect(reinterpret_cast<void *>(page.address), kPageSize,
+                             page.perms | PROT_WRITE) != 0) {
+                Fail(HookError::ProtectFailed, errno);
+                Rollback();
+                return;
+            }
+            page.writable = true;
+        }
+        if (backup) *backup = reinterpret_cast<void *>(slots.front().before);
+        for (auto &slot : slots) {
+            if (slot.before == callback) continue;
+            auto expected = slot.before;
+            if (!__atomic_compare_exchange_n(reinterpret_cast<uintptr_t *>(slot.address),
+                                             &expected, callback, false,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                Fail(HookError::SlotConflict, EBUSY);
+                Rollback();
+                return;
+            }
+            slot.published = true;
+            ever_published = true;
+        }
+        if (!RestorePermissions()) {
+            Fail(rollback_error, rollback_error_number);
+            Rollback();
+            return;
+        }
+        for (const auto &slot : slots) {
+            if (__atomic_load_n(reinterpret_cast<uintptr_t *>(slot.address), __ATOMIC_ACQUIRE) != callback) {
+                Fail(HookError::SlotConflict, EBUSY);
+                Rollback();
+                return;
+            }
+        }
+        for (const auto &slot : slots) {
+            auto record = slot.owner->hooks.find(slot.address);
+            if (record != slot.owner->hooks.end()) {
+                if (record->second == callback) slot.owner->hooks.erase(record);
+            } else if (auto node = new_records.extract(slot.address); !node.empty()) {
+                slot.owner->hooks.insert(std::move(node));
+            }
+        }
+        status = CommitStatus::Applied;
+    }
+
+    bool ValidateRecovery(const std::vector<lsplt::MapInfo> &maps) {
+        observed = std::all_of(slots.begin(), slots.end(), [&](const auto &slot) {
+            return std::any_of(maps.begin(), maps.end(), [&](const auto &map) {
+                const auto page = pages[slot.page].address;
+                return map.is_private && (map.perms & PROT_READ) &&
+                       map.dev == slot.owner->dev && map.inode == slot.owner->inode &&
+                       page >= map.start && page < map.end && map.end - page >= kPageSize &&
+                       map.offset + page - map.start == slot.owner->offset + page - slot.owner->start;
+            });
+        });
+        if (!observed) {
+            rollback_error = HookError::MapUnavailable;
+            rollback_error_number = ESTALE;
+            status = CommitStatus::RollbackIncomplete;
+        }
+        return observed;
+    }
+
+    void PrepareReport(RegistrationResult &result, bool recovery = false) const {
+        result.dev = request.dev;
+        result.inode = request.inode;
+        result.offset_range = request.offset_range;
+        result.symbol = request.symbol;
+        result.callback = request.callback;
+        result.recovery = recovery;
+        result.slots.resize(slots.size());
+    }
+
+    void FinishReport(RegistrationResult &result) const {
+        result.status = status;
+        result.error = error;
+        result.error_number = error_number;
+        result.rollback_error = rollback_error;
+        result.rollback_error_number = rollback_error_number;
+        result.ever_published = ever_published;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto &slot = slots[i];
+            const auto &page = pages[slot.page];
+            result.slots[i] = {slot.address, slot.before,
+                observed ? __atomic_load_n(reinterpret_cast<uintptr_t *>(slot.address), __ATOMIC_ACQUIRE) : 0,
+                observed, !page.writable || bool(page.perms & PROT_WRITE)};
+        }
+    }
+};
+
+std::unique_ptr<Transaction> pending_rollback;
 
 HookInfos FreshHookInfo() {
     map_cache = lsplt::MapInfo::Scan();
@@ -333,6 +538,71 @@ HookInfos FreshHookInfo() {
 HookInfos CachedHookInfo() {
     if (!map_cache_ready) return {};
     return HookInfos::FromMaps(map_cache);
+}
+
+bool Commit(bool cached, CommitReport *report) {
+    bool success = true;
+    bool maps_available = true;
+    int failure = 0;
+    if (report) report->registrations.reserve(register_info.size() + (pending_rollback ? 1 : 0));
+    if (pending_rollback) {
+        RegistrationResult *result = nullptr;
+        if (report) {
+            result = &report->registrations.emplace_back();
+            pending_rollback->PrepareReport(*result, true);
+        }
+        const auto maps = cached ? map_cache : lsplt::MapInfo::Scan();
+        const bool recovered = pending_rollback->ValidateRecovery(maps) && pending_rollback->Rollback(true);
+        if (result) pending_rollback->FinishReport(*result);
+        if (recovered) pending_rollback.reset();
+        else { success = false; failure = EUCLEAN; }
+    }
+    if (!pending_rollback && !register_info.empty()) {
+        auto fresh = cached ? CachedHookInfo() : FreshHookInfo();
+        if (!fresh.empty()) {
+            fresh.Filter(register_info);
+            fresh.Merge(hook_info);
+            hook_info = std::move(fresh);
+        } else {
+            maps_available = false;
+            success = false;
+            failure = ENOENT;
+        }
+    }
+    while (!register_info.empty()) {
+        const auto &reg = register_info.front();
+        auto transaction = std::make_unique<Transaction>(reg);
+        RegistrationResult *result = report ? &report->registrations.emplace_back() : nullptr;
+        if (pending_rollback) {
+            transaction->status = CommitStatus::Blocked;
+            transaction->Fail(HookError::PendingRollback, EUCLEAN);
+        } else if (!maps_available) {
+            transaction->Fail(HookError::MapUnavailable, ENOENT);
+        } else if (transaction->Prepare(reg.backup != nullptr)) {
+            if (result) transaction->PrepareReport(*result);
+            transaction->Execute(reg.backup);
+        }
+        if (result) {
+            if (result->symbol.empty()) transaction->PrepareReport(*result);
+            transaction->FinishReport(*result);
+        }
+        if (transaction->status != CommitStatus::Applied && transaction->status != CommitStatus::NoChange) {
+            success = false;
+            if (failure == 0) failure = transaction->error_number;
+        }
+        if (transaction->status == CommitStatus::RollbackIncomplete) {
+            pending_rollback = std::move(transaction);
+            failure = EUCLEAN;
+        }
+        register_info.erase(register_info.begin());
+    }
+    if (report) {
+        report->success = success;
+        report->rollback_pending = bool(pending_rollback);
+        report->error_number = failure;
+    }
+    errno = failure;
+    return success;
 }
 }  // namespace
 
@@ -383,7 +653,7 @@ inline namespace v2 {
 
 [[maybe_unused]] bool RegisterHook(dev_t dev, ino_t inode, std::string_view symbol, void *callback,
                                    void **backup) {
-    if (dev == 0 || inode == 0 || symbol.empty() || !callback) return false;
+    if (dev == 0 || inode == 0 || symbol.empty() || !callback) { errno = EINVAL; return false; }
 
     const std::unique_lock lock(hook_mutex);
     static_assert(std::numeric_limits<uintptr_t>::min() == 0);
@@ -399,7 +669,8 @@ inline namespace v2 {
 
 [[maybe_unused]] bool RegisterHook(dev_t dev, ino_t inode, uintptr_t offset, size_t size,
                                    std::string_view symbol, void *callback, void **backup) {
-    if (dev == 0 || inode == 0 || symbol.empty() || !callback) return false;
+    if (dev == 0 || inode == 0 || symbol.empty() || !callback || size == 0 ||
+        size > std::numeric_limits<uintptr_t>::max() - offset) { errno = EINVAL; return false; }
 
     const std::unique_lock lock(hook_mutex);
     static_assert(std::numeric_limits<uintptr_t>::min() == 0);
@@ -414,34 +685,31 @@ inline namespace v2 {
 
 [[maybe_unused]] bool CommitHook() {
     const std::unique_lock lock(hook_mutex);
-    if (register_info.empty()) return true;
-
-    auto new_hook_info = FreshHookInfo();
-    if (new_hook_info.empty()) return false;
-
-    new_hook_info.Filter(register_info);
-
-    new_hook_info.Merge(hook_info);
-    // update to new map info
-    hook_info = std::move(new_hook_info);
-
-    return hook_info.DoHook(register_info);
+    return Commit(false, nullptr);
 }
 
 [[maybe_unused]] bool CommitHookCached() {
     const std::unique_lock lock(hook_mutex);
-    if (register_info.empty()) return true;
-    auto new_hook_info = CachedHookInfo();
-    if (new_hook_info.empty()) return false;
-    new_hook_info.Filter(register_info);
-    new_hook_info.Merge(hook_info);
-    hook_info = std::move(new_hook_info);
-    return hook_info.DoHook(register_info);
+    return Commit(true, nullptr);
+}
+
+[[maybe_unused]] CommitReport CommitHookDetailed() {
+    const std::unique_lock lock(hook_mutex);
+    CommitReport report;
+    Commit(false, &report);
+    return report;
+}
+
+[[maybe_unused]] CommitReport CommitHookCachedDetailed() {
+    const std::unique_lock lock(hook_mutex);
+    CommitReport report;
+    Commit(true, &report);
+    return report;
 }
 
 [[maybe_unused]] bool ReleaseInactiveCache() {
     const std::unique_lock lock(hook_mutex);
-    if (!register_info.empty()) return false;
+    if (!register_info.empty() || pending_rollback) return false;
     for (const auto &[address, info] : hook_info) {
         if (info.backup || !info.hooks.empty()) return false;
     }
@@ -454,6 +722,13 @@ inline namespace v2 {
 
 [[gnu::destructor]] [[maybe_unused]] bool InvalidateBackup() {
     const std::unique_lock lock(hook_mutex);
+    if (pending_rollback) {
+        if (!pending_rollback->ValidateRecovery(MapInfo::Scan()) || !pending_rollback->Rollback(true)) {
+            errno = EUCLEAN;
+            return false;
+        }
+        pending_rollback.reset();
+    }
     return hook_info.InvalidateBackup();
 }
 }  // namespace v2

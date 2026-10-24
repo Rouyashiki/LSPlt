@@ -2,8 +2,10 @@
 
 #include <sys/types.h>
 
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 /// \namespace lsplt
@@ -59,7 +61,7 @@ struct MapInfo {
 /// \return Whether the hook is successfully registered.
 /// \note This function is thread-safe.
 /// \note \p backup will not be available until #CommitHook() is called.
-/// \note A failed commit may still initialize \p backup if a slot was published before rollback.
+/// \note A failed commit may initialize \p backup; it remains valid after publication/rollback.
 /// \note You can unhook the function by calling this function with \p callback set to the backup
 /// set by previous call.
 /// \note Hooks update aligned pointer slots in place and restore page permissions after each write.
@@ -84,7 +86,7 @@ struct MapInfo {
 /// \return Whether the hook is successfully registered.
 /// \note This function is thread-safe.
 /// \note \p backup will not be available until #CommitHook() is called.
-/// \note A failed commit may still initialize \p backup if a slot was published before rollback.
+/// \note A failed commit may initialize \p backup; it remains valid after publication/rollback.
 /// \note You can unhook the function by calling this function with \p callback set to the backup
 /// set by previous call.
 /// \note Hooks update aligned pointer slots in place and restore page permissions after each write.
@@ -97,8 +99,7 @@ struct MapInfo {
 /// cannot be found.
 /// \note The \p size can be inaccurate but should be larger or equal to the library size,
 /// otherwise the hook may fail when the hook pointer is beyond the range.
-/// \note The behaviour of this function is undefined if \p offset + \p size is larger than the
-/// the maximum value of \p size_t.
+/// \note Empty or overflowing offset ranges are rejected with EINVAL.
 /// \see #CommitHook()
 /// \see #InvalidateBackup()
 [[maybe_unused, gnu::visibility("default")]] bool RegisterHook(dev_t dev, ino_t inode, uintptr_t offset,
@@ -108,7 +109,10 @@ struct MapInfo {
 /// \return Whether all hooks are successfully committed. If any of the hooks fail to commit,
 /// the result is false.
 /// \note This function is thread-safe.
-/// \note A non-null backup alone does not prove success: a published slot may have been rolled back.
+/// \note Neither false nor a non-null backup determines whether a callback was published.
+/// A published slot may have been rolled back, and its callback may still be executing.
+/// Each registration is transactional. Incomplete recovery blocks new writes and cache release.
+/// Failure sets errno; use #CommitHookDetailed() to distinguish failure and recovery outcomes.
 /// \see #RegisterHook()
 [[maybe_unused, gnu::visibility("default")]] bool CommitHook();
 
@@ -118,6 +122,59 @@ struct MapInfo {
 /// \note This function is intended for a fork child whose mappings still
 /// match the state inherited from its parent.
 [[maybe_unused, gnu::visibility("default")]] bool CommitHookCached();
+
+enum class CommitStatus {
+    Applied, NoChange, Rejected, RolledBack, RollbackIncomplete, Blocked
+};
+
+enum class HookError {
+    None, MapUnavailable, InvalidElf, SymbolNotFound, InvalidSlot,
+    InconsistentOriginal, ProtectFailed, SlotConflict, PendingRollback
+};
+
+struct SlotResult {
+    uintptr_t address = 0;
+    uintptr_t before = 0;
+    uintptr_t after = 0;
+    bool observed = false;
+    bool permissions_restored = true;
+};
+
+struct RegistrationResult {
+    dev_t dev = 0;
+    ino_t inode = 0;
+    std::pair<uintptr_t, uintptr_t> offset_range{};
+    std::string symbol;
+    void *callback = nullptr;
+    CommitStatus status = CommitStatus::Rejected;
+    HookError error = HookError::None;
+    HookError rollback_error = HookError::None;
+    int error_number = 0;
+    int rollback_error_number = 0;
+    bool ever_published = false;
+    bool recovery = false;
+    std::vector<SlotResult> slots;
+};
+
+struct CommitReport {
+    bool success = true;
+    bool rollback_pending = false;
+    int error_number = 0;
+    std::vector<RegistrationResult> registrations;
+};
+
+/// Each registration is a transaction; successful sibling registrations are retained.
+/// A failed transaction restores its own prior slot values and page permissions, or
+/// retains a recovery journal which blocks new writes until a later commit repairs it.
+/// Requests blocked by an incomplete rollback are consumed, not replayed later.
+/// The report distinguishes publication from final installation. A callback may have
+/// run even after a complete rollback: retain its backup and code until safe retirement.
+/// A new installation requesting one backup rejects heterogeneous original pointers.
+/// Repeated installation does not overwrite an existing backup with the callback.
+[[maybe_unused, gnu::visibility("default")]] CommitReport CommitHookDetailed();
+
+/// Same transaction semantics, using inherited maps without reading procfs.
+[[maybe_unused, gnu::visibility("default")]] CommitReport CommitHookCachedDetailed();
 
 /// Release cached state only after all hooks and backup mappings are gone.
 [[maybe_unused, gnu::visibility("default")]] bool ReleaseInactiveCache();
