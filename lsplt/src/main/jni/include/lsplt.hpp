@@ -59,14 +59,12 @@ struct MapInfo {
 /// \return Whether the hook is successfully registered.
 /// \note This function is thread-safe.
 /// \note \p backup will not be available until #CommitHook() is called.
-/// \note \p backup will be nullptr if the hook fails.
+/// \note A failed commit may still initialize \p backup if a slot was published before rollback.
 /// \note You can unhook the function by calling this function with \p callback set to the backup
 /// set by previous call.
-/// \note LSPlt will backup the hook memory region and restore it when the
-/// hook is restored to its original function pointer so that there won't be dirty pages. LSPlt will
-/// do hooks on a copied memory region so that the original memory region will not be modified. You
-/// can invalidate this behaviour and hook the original memory region by calling
-/// #InvalidateBackup().
+/// \note Hooks update aligned pointer slots in place and restore page permissions after each write.
+/// Unhooking restores the saved pointer while retaining the original file mapping. Private dirty
+/// pages may remain. #InvalidateBackup() discards restoration bookkeeping without removing hooks.
 /// \see #CommitHook()
 /// \see #InvalidateBackup()
 [[maybe_unused, gnu::visibility("default")]] bool RegisterHook(dev_t dev, ino_t inode, std::string_view symbol,
@@ -86,14 +84,12 @@ struct MapInfo {
 /// \return Whether the hook is successfully registered.
 /// \note This function is thread-safe.
 /// \note \p backup will not be available until #CommitHook() is called.
-/// \note \p backup will be nullptr if the hook fails.
+/// \note A failed commit may still initialize \p backup if a slot was published before rollback.
 /// \note You can unhook the function by calling this function with \p callback set to the backup
 /// set by previous call.
-/// \note LSPlt will backup the hook memory region and restore it when the
-/// hook is restored to its original function pointer so that there won't be dirty pages. LSPlt will
-/// do hooks on a copied memory region so that the original memory region will not be modified. You
-/// can invalidate this behaviour and hook the original memory region by calling
-/// #InvalidateBackup().
+/// \note Hooks update aligned pointer slots in place and restore page permissions after each write.
+/// Unhooking restores the saved pointer while retaining the original file mapping. Private dirty
+/// pages may remain. #InvalidateBackup() discards restoration bookkeeping without removing hooks.
 /// \note You can get the offset range of the library by getting its entry offset and size in the
 /// zip file.
 /// \note According to the Android linker specification, the \p offset must be page aligned.
@@ -112,8 +108,7 @@ struct MapInfo {
 /// \return Whether all hooks are successfully committed. If any of the hooks fail to commit,
 /// the result is false.
 /// \note This function is thread-safe.
-/// \note The return value indicates whether all hooks are successfully committed. You can
-/// determine which hook fails by checking the backup function pointer of #RegisterHook().
+/// \note A non-null backup alone does not prove success: a published slot may have been rolled back.
 /// \see #RegisterHook()
 [[maybe_unused, gnu::visibility("default")]] bool CommitHook();
 
@@ -128,10 +123,8 @@ struct MapInfo {
 [[maybe_unused, gnu::visibility("default")]] bool ReleaseInactiveCache();
 
 /// \brief Invalidate backup memory regions
-/// Normally LSPlt will backup the hooked memory region and do hook on a copied anonymous memory
-/// region, and restore the original memory region when the hook is unregistered
-/// (when the callback of #RegisterHook() is the original function). This function will restore
-/// the backup memory region and do all existing hooks on the original memory region.
+/// Keeps installed hooks in the original mapping and discards restoration bookkeeping after
+/// restoring page permissions. Any legacy backup mappings are restored with their hooks reapplied.
 /// \return Whether all hooks are successfully invalidated. If any of the hooks fail to invalidate,
 /// the result is false.
 /// \note This function is thread-safe.

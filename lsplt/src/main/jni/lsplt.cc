@@ -105,6 +105,13 @@ public:
     void Merge(HookInfos &old) {
         // merge with old map info
         for (auto &info : old) {
+            if (!info.second.backup && !info.second.hooks.empty()) {
+                // A failed protection restore can split the original mapping.
+                auto iter = lower_bound(info.second.end - 1);
+                while (iter != end() && iter->first >= info.first) iter = erase(iter);
+                emplace(info.first, std::move(info.second));
+                continue;
+            }
             if (info.second.backup) {
                 erase(info.second.backup);
             }
@@ -114,6 +121,50 @@ public:
                 emplace(info.first, std::move(info.second));
             }
         }
+    }
+
+    bool DoHookInPlace(uintptr_t addr, uintptr_t callback, uintptr_t *backup) {
+        static_assert(__atomic_always_lock_free(sizeof(uintptr_t), nullptr));
+        auto iter = lower_bound(addr);
+        if (iter == end() || addr % alignof(uintptr_t) != 0 ||
+            addr < iter->second.start || addr >= iter->second.end ||
+            iter->second.end - addr < sizeof(uintptr_t)) {
+            errno = EINVAL;
+            LOGE("Invalid PLT slot: %d", errno);
+            return false;
+        }
+        auto &info = iter->second;
+        auto *slot = reinterpret_cast<uintptr_t *>(addr);
+        const auto previous = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+        auto record = info.hooks.find(addr);
+        if (previous == callback && record == info.hooks.end()) return true;
+        const bool inserted = record == info.hooks.end();
+        if (inserted) record = info.hooks.emplace(addr, previous).first;
+        const bool protect = !(info.perms & PROT_WRITE);
+        if (protect && sys_mprotect(PageStart(addr), kPageSize, info.perms | PROT_WRITE) != 0) {
+            if (inserted) info.hooks.erase(record);
+            LOGE("Making PLT page writable: %d", errno);
+            return false;
+        }
+
+        if (previous != callback) {
+            // A callback can run as soon as its slot is published.
+            if (backup) *backup = previous;
+            __atomic_store_n(slot, callback, __ATOMIC_RELEASE);
+        }
+        if (protect && sys_mprotect(PageStart(addr), kPageSize, info.perms) != 0) {
+            const int error = errno;
+            __atomic_store_n(slot, previous, __ATOMIC_RELEASE);
+            if (sys_mprotect(PageStart(addr), kPageSize, info.perms) == 0) {
+                if (inserted) info.hooks.erase(record);
+            }
+            // Keep the record on a failed rollback so cleanup can retry protection.
+            errno = error;
+            LOGE("Restoring PLT page protection: %d", errno);
+            return false;
+        }
+        if (record->second == callback) info.hooks.erase(record);
+        return true;
     }
 
     bool DoHook(uintptr_t addr, uintptr_t callback, uintptr_t *backup) {
@@ -191,14 +242,7 @@ public:
 
     bool DoHook(std::vector<RegisterInfo> &register_info) {
         bool res = true;
-        // Consume front-to-back, dropping each entry only once it is done. This is
-        // not the tidiest loop, but it is exactly what the std::list version did,
-        // including when something throws partway through: only the unprocessed
-        // tail is left behind. Clearing at the end instead would leave already
-        // hooked entries queued, and re-hooking an address is read as a toggle by
-        // DoHook(addr, ...) below -- it drops the hook record and mremaps the
-        // original page back, silently undoing the hook. erase() keeps the
-        // capacity, so the steady state is still allocation-free.
+        // Preserve unprocessed registrations if a later hook throws.
         while (!register_info.empty()) {
             const auto &reg = register_info.front();
             bool found = false;
@@ -215,8 +259,8 @@ public:
                     for (auto addr : addresses) {
                         found = true;
                         committed =
-                            DoHook(addr, reinterpret_cast<uintptr_t>(reg.callback),
-                                   reinterpret_cast<uintptr_t *>(reg.backup)) &&
+                            DoHookInPlace(addr, reinterpret_cast<uintptr_t>(reg.callback),
+                                          reinterpret_cast<uintptr_t *>(reg.backup)) &&
                             committed;
                     }
                 }
@@ -230,7 +274,20 @@ public:
     bool InvalidateBackup() {
         bool res = true;
         for (auto &[_, info] : *this) {
-            if (!info.backup) continue;
+            if (!info.backup) {
+                bool protected_all = true;
+                if (!(info.perms & PROT_WRITE)) {
+                    for (const auto &[addr, original] : info.hooks) {
+                        if (sys_mprotect(PageStart(addr), kPageSize, info.perms) != 0) {
+                            LOGE("Restoring PLT page protection during invalidation: %d", errno);
+                            protected_all = false;
+                        }
+                    }
+                }
+                if (protected_all) info.hooks.clear();
+                res = protected_all && res;
+                continue;
+            }
             for (auto &[addr, backup] : info.hooks) {
                 // store new address to backup since we don't need backup
                 backup = *reinterpret_cast<uintptr_t *>(addr);
