@@ -3,6 +3,7 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -129,7 +130,8 @@ enum class CommitStatus {
 
 enum class HookError {
     None, MapUnavailable, InvalidElf, SymbolNotFound, InvalidSlot,
-    InconsistentOriginal, ProtectFailed, SlotConflict, PendingRollback
+    InconsistentOriginal, ProtectFailed, SlotConflict, PendingRollback,
+    OriginalUnavailable, InvalidRequest
 };
 
 struct SlotResult {
@@ -163,6 +165,39 @@ struct CommitReport {
     std::vector<RegistrationResult> registrations;
 };
 
+enum class HookOperation { Replace, Restore };
+
+struct HookRequest {
+    dev_t dev = 0;
+    ino_t inode = 0;
+    std::string_view symbol;
+    void *callback = nullptr;
+    void **backup = nullptr;
+    std::pair<uintptr_t, uintptr_t> offset_range{0, std::numeric_limits<uintptr_t>::max()};
+    HookOperation operation = HookOperation::Replace;
+    void *expected_current = nullptr;
+};
+
+struct HookBatchReport {
+    bool success = true;
+    bool rollback_pending = false;
+    int error_number = 0;
+    std::vector<RegistrationResult> results;
+    std::vector<RegistrationResult> recoveries;
+};
+
+/// Apply only these requests under one lock without consuming the RegisterHook queue.
+/// Results correspond one-to-one to input requests; each request is its own transaction.
+/// An empty list only retries pending recovery. Requests blocked by recovery are not queued.
+/// Restore requires expected_current and a null backup; slots already at callback are accepted.
+/// Neither successful restoration nor rollback proves that a callback has stopped executing.
+[[maybe_unused, gnu::visibility("default")]] HookBatchReport ApplyHooksDetailed(
+    const std::vector<HookRequest> &requests);
+
+/// Same isolated request semantics, using inherited maps without reading procfs.
+[[maybe_unused, gnu::visibility("default")]] HookBatchReport ApplyHooksCachedDetailed(
+    const std::vector<HookRequest> &requests);
+
 /// Each registration is a transaction; successful sibling registrations are retained.
 /// A failed transaction restores its own prior slot values and page permissions, or
 /// retains a recovery journal which blocks new writes until a later commit repairs it.
@@ -170,7 +205,9 @@ struct CommitReport {
 /// The report distinguishes publication from final installation. A callback may have
 /// run even after a complete rollback: retain its backup and code until safe retirement.
 /// A new installation requesting one backup rejects heterogeneous original pointers.
-/// Repeated installation does not overwrite an existing backup with the callback.
+/// Repeated installation fills backup from a consistent, tracked direct predecessor.
+/// Missing provenance rejects a backup request with OriginalUnavailable/ENODATA.
+/// Backup is output-only; its previous contents are never read.
 [[maybe_unused, gnu::visibility("default")]] CommitReport CommitHookDetailed();
 
 /// Same transaction semantics, using inherited maps without reading procfs.

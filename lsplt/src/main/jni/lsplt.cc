@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -33,6 +34,21 @@ struct RegisterInfo {
     std::string symbol;
     void *callback;
     void **backup;
+    lsplt::HookOperation operation = lsplt::HookOperation::Replace;
+    void *expected_current = nullptr;
+};
+
+struct HookLayer {
+    uintptr_t callback;
+    uintptr_t previous;
+};
+
+struct HookChain {
+    uintptr_t root = 0;
+    bool disconnected = false;
+    std::vector<HookLayer> layers;
+
+    uintptr_t Current() const { return layers.empty() ? root : layers.back().callback; }
 };
 
 std::vector<lsplt::MapInfo> map_cache;
@@ -43,6 +59,7 @@ struct HookInfo : public lsplt::MapInfo {
     uintptr_t backup;
     std::unique_ptr<Elf> elf;
     bool self;
+    std::map<uintptr_t, HookChain> chains{};
     [[nodiscard]] bool Match(const RegisterInfo &info) const {
         return info.dev == dev && info.inode == inode && offset >= info.offset_range.first &&
                offset < info.offset_range.second;
@@ -211,7 +228,10 @@ public:
                         }
                     }
                 }
-                if (protected_all) info.hooks.clear();
+                if (protected_all) {
+                    info.hooks.clear();
+                    info.chains.clear();
+                }
                 res = protected_all && res;
                 continue;
             }
@@ -226,6 +246,7 @@ public:
                 new_addr == MAP_FAILED || reinterpret_cast<uintptr_t>(new_addr) != info.start) {
                 res = false;
                 info.hooks.clear();
+                info.chains.clear();
                 continue;
             }
             if (!mprotect(PageStart(info.start), len, PROT_WRITE)) {
@@ -235,6 +256,7 @@ public:
                 mprotect(PageStart(info.start), len, info.perms);
             }
             info.hooks.clear();
+            info.chains.clear();
             info.backup = 0;
         }
         return res;
@@ -263,12 +285,15 @@ struct Transaction {
         HookInfo *owner;
         size_t page;
         bool published = false;
+        bool erase_record = false;
     };
 
     RegisterInfo request;
     std::vector<Slot> slots;
     std::vector<Page> pages;
     std::map<uintptr_t, uintptr_t> new_records;
+    std::map<uintptr_t, HookChain> new_chains;
+    uintptr_t original = 0;
     CommitStatus status = CommitStatus::Rejected;
     HookError error = HookError::None;
     HookError rollback_error = HookError::None;
@@ -278,7 +303,8 @@ struct Transaction {
     bool observed = true;
 
     explicit Transaction(const RegisterInfo &reg)
-        : request{reg.dev, reg.inode, reg.offset_range, reg.symbol, reg.callback, nullptr} {}
+        : request{reg.dev, reg.inode, reg.offset_range, reg.symbol, reg.callback, nullptr,
+                  reg.operation, reg.expected_current} {}
 
     void Fail(HookError cause, int number) {
         if (error == HookError::None) { error = cause; error_number = number; }
@@ -298,6 +324,87 @@ struct Transaction {
                    address >= map.start && address < map.end && map.end - address >= size &&
                    map.offset + address - map.start == owner.offset + address - owner.start;
         });
+    }
+
+    bool ValidRequest(bool needs_backup) {
+        const bool restore = request.operation == lsplt::HookOperation::Restore;
+        if (request.dev == 0 || request.inode == 0 || request.symbol.empty() ||
+            !request.callback || request.offset_range.first >= request.offset_range.second ||
+            (restore && (!request.expected_current || needs_backup)) ||
+            (!restore && (request.operation != lsplt::HookOperation::Replace || request.expected_current))) {
+            Fail(HookError::InvalidRequest, EINVAL);
+            return false;
+        }
+        return true;
+    }
+
+    void PrepareRecord(Slot &slot, bool needs_backup) {
+        const auto callback = reinterpret_cast<uintptr_t>(request.callback);
+        const auto record = slot.owner->hooks.find(slot.address);
+        const bool tracked = record != slot.owner->hooks.end();
+        const auto previous_chain = slot.owner->chains.find(slot.address);
+        HookChain chain;
+        if (request.operation == lsplt::HookOperation::Restore) {
+            if (previous_chain != slot.owner->chains.end() && !previous_chain->second.layers.empty() &&
+                previous_chain->second.layers.back().callback == reinterpret_cast<uintptr_t>(request.expected_current) &&
+                previous_chain->second.layers.back().previous == callback) {
+                chain = previous_chain->second;
+                chain.layers.pop_back();
+            } else {
+                if (slot.before == callback || !tracked) return;
+                chain.root = callback;
+                chain.disconnected = true;
+            }
+        } else {
+            if (slot.before == callback) {
+                if (!needs_backup && tracked && record->second == callback &&
+                    previous_chain != slot.owner->chains.end() && !previous_chain->second.disconnected)
+                    slot.erase_record = true;
+                return;
+            }
+            if (previous_chain != slot.owner->chains.end() && previous_chain->second.Current() == slot.before) {
+                chain = previous_chain->second;
+            } else {
+                chain.root = slot.before;
+                chain.disconnected = tracked;
+            }
+            bool restored = tracked && record->second == callback && !chain.disconnected;
+            if (restored) chain.layers.clear();
+            if (!restored && !needs_backup) {
+                for (size_t i = chain.layers.size(); i > 0; --i) {
+                    if (chain.layers[i - 1].previous == callback) {
+                        chain.layers.resize(i - 1);
+                        restored = true;
+                        break;
+                    }
+                }
+            }
+            if (!restored) chain.layers.push_back({callback, slot.before});
+        }
+        const auto baseline = tracked ? record->second : slot.before;
+        if (!chain.disconnected && chain.layers.empty() && callback == baseline) {
+            slot.erase_record = true;
+            return;
+        }
+        if (!tracked) new_records.emplace(slot.address, baseline);
+        new_chains.emplace(slot.address, std::move(chain));
+    }
+
+    void CommitRecords() {
+        for (const auto &slot : slots) {
+            if (slot.erase_record) {
+                slot.owner->hooks.erase(slot.address);
+                slot.owner->chains.erase(slot.address);
+                continue;
+            }
+            if (auto node = new_records.extract(slot.address); !node.empty())
+                slot.owner->hooks.insert(std::move(node));
+            if (auto node = new_chains.extract(slot.address); !node.empty()) {
+                auto existing = slot.owner->chains.find(slot.address);
+                if (existing == slot.owner->chains.end()) slot.owner->chains.insert(std::move(node));
+                else std::swap(existing->second, node.mapped());
+            }
+        }
     }
 
     bool Prepare(bool needs_backup) {
@@ -343,20 +450,43 @@ struct Transaction {
             slots.push_back({address, before, &owner, pages.size() - 1});
         }
         const auto callback = reinterpret_cast<uintptr_t>(request.callback);
+        if (request.operation == lsplt::HookOperation::Restore &&
+            std::any_of(slots.begin(), slots.end(), [&](const auto &slot) {
+                return slot.before != callback &&
+                       slot.before != reinterpret_cast<uintptr_t>(request.expected_current);
+            })) {
+            Fail(HookError::SlotConflict, EBUSY);
+            return false;
+        }
         if (needs_backup) {
-            const auto original = slots.front().before;
+            original = slots.front().before;
             if (original == 0 || std::any_of(slots.begin(), slots.end(), [&](const auto &slot) {
                     return slot.before != original;
                 })) {
                 Fail(HookError::InconsistentOriginal, EINVAL);
                 return false;
             }
+            if (original == callback) {
+                original = 0;
+                for (const auto &slot : slots) {
+                    auto chain = slot.owner->chains.find(slot.address);
+                    if (chain == slot.owner->chains.end() || chain->second.layers.empty() ||
+                        chain->second.Current() != callback || chain->second.layers.back().previous == 0 ||
+                        chain->second.layers.back().previous == callback) {
+                        Fail(HookError::OriginalUnavailable, ENODATA);
+                        return false;
+                    }
+                    const auto previous = chain->second.layers.back().previous;
+                    if (original != 0 && original != previous) {
+                        Fail(HookError::InconsistentOriginal, EINVAL);
+                        return false;
+                    }
+                    original = previous;
+                }
+            }
         }
-        // Allocate every potential hook node before making any page writable.
-        for (const auto &slot : slots) {
-            if (slot.before != callback && !slot.owner->hooks.count(slot.address))
-                new_records.emplace(slot.address, slot.before);
-        }
+        // Prepare all metadata before publishing any pointer or changing permissions.
+        for (auto &slot : slots) PrepareRecord(slot, needs_backup);
         return true;
     }
 
@@ -427,11 +557,8 @@ struct Transaction {
                     return;
                 }
             }
-            for (const auto &slot : slots) {
-                auto record = slot.owner->hooks.find(slot.address);
-                if (record != slot.owner->hooks.end() && record->second == callback)
-                    slot.owner->hooks.erase(record);
-            }
+            if (backup) *backup = reinterpret_cast<void *>(original);
+            CommitRecords();
             status = CommitStatus::NoChange;
             return;
         }
@@ -445,7 +572,7 @@ struct Transaction {
             }
             page.writable = true;
         }
-        if (backup) *backup = reinterpret_cast<void *>(slots.front().before);
+        if (backup) *backup = reinterpret_cast<void *>(original);
         for (auto &slot : slots) {
             if (slot.before == callback) continue;
             auto expected = slot.before;
@@ -471,14 +598,7 @@ struct Transaction {
                 return;
             }
         }
-        for (const auto &slot : slots) {
-            auto record = slot.owner->hooks.find(slot.address);
-            if (record != slot.owner->hooks.end()) {
-                if (record->second == callback) slot.owner->hooks.erase(record);
-            } else if (auto node = new_records.extract(slot.address); !node.empty()) {
-                slot.owner->hooks.insert(std::move(node));
-            }
-        }
+        CommitRecords();
         status = CommitStatus::Applied;
     }
 
@@ -540,47 +660,46 @@ HookInfos CachedHookInfo() {
     return HookInfos::FromMaps(map_cache);
 }
 
-bool Commit(bool cached, CommitReport *report) {
+bool ExecuteRequests(bool cached, const std::vector<RegisterInfo> &requests,
+                     std::vector<RegistrationResult> *results,
+                     std::vector<RegistrationResult> *recoveries, int &failure) {
     bool success = true;
     bool maps_available = true;
-    int failure = 0;
-    if (report) report->registrations.reserve(register_info.size() + (pending_rollback ? 1 : 0));
+    failure = 0;
+    if (results) results->reserve(requests.size() + (results == recoveries && pending_rollback ? 1 : 0));
+    if (recoveries && recoveries != results) recoveries->reserve(pending_rollback ? 1 : 0);
     if (pending_rollback) {
-        RegistrationResult *result = nullptr;
-        if (report) {
-            result = &report->registrations.emplace_back();
-            pending_rollback->PrepareReport(*result, true);
-        }
+        RegistrationResult *result = recoveries ? &recoveries->emplace_back() : nullptr;
+        if (result) pending_rollback->PrepareReport(*result, true);
         const auto maps = cached ? map_cache : lsplt::MapInfo::Scan();
         const bool recovered = pending_rollback->ValidateRecovery(maps) && pending_rollback->Rollback(true);
         if (result) pending_rollback->FinishReport(*result);
         if (recovered) pending_rollback.reset();
         else { success = false; failure = EUCLEAN; }
     }
-    if (!pending_rollback && !register_info.empty()) {
+    if (!pending_rollback && !requests.empty()) {
         auto fresh = cached ? CachedHookInfo() : FreshHookInfo();
         if (!fresh.empty()) {
-            fresh.Filter(register_info);
+            fresh.Filter(requests);
             fresh.Merge(hook_info);
             hook_info = std::move(fresh);
         } else {
             maps_available = false;
-            success = false;
-            failure = ENOENT;
         }
     }
-    while (!register_info.empty()) {
-        const auto &reg = register_info.front();
+    for (const auto &reg : requests) {
         auto transaction = std::make_unique<Transaction>(reg);
-        RegistrationResult *result = report ? &report->registrations.emplace_back() : nullptr;
+        RegistrationResult *result = results ? &results->emplace_back() : nullptr;
         if (pending_rollback) {
             transaction->status = CommitStatus::Blocked;
             transaction->Fail(HookError::PendingRollback, EUCLEAN);
-        } else if (!maps_available) {
-            transaction->Fail(HookError::MapUnavailable, ENOENT);
-        } else if (transaction->Prepare(reg.backup != nullptr)) {
-            if (result) transaction->PrepareReport(*result);
-            transaction->Execute(reg.backup);
+        } else if (transaction->ValidRequest(reg.backup != nullptr)) {
+            if (!maps_available) {
+                transaction->Fail(HookError::MapUnavailable, ENOENT);
+            } else if (transaction->Prepare(reg.backup != nullptr)) {
+                if (result) transaction->PrepareReport(*result);
+                transaction->Execute(reg.backup);
+            }
         }
         if (result) {
             if (result->symbol.empty()) transaction->PrepareReport(*result);
@@ -594,16 +713,39 @@ bool Commit(bool cached, CommitReport *report) {
             pending_rollback = std::move(transaction);
             failure = EUCLEAN;
         }
-        register_info.erase(register_info.begin());
     }
+    errno = failure;
+    return success;
+}
+
+bool Commit(bool cached, CommitReport *report) {
+    int failure = 0;
+    auto *results = report ? &report->registrations : nullptr;
+    const bool success = ExecuteRequests(cached, register_info, results, results, failure);
+    register_info.clear();
     if (report) {
         report->success = success;
         report->rollback_pending = bool(pending_rollback);
         report->error_number = failure;
     }
-    errno = failure;
     return success;
 }
+
+lsplt::HookBatchReport ApplyRequests(bool cached, const std::vector<lsplt::HookRequest> &requests) {
+    std::vector<RegisterInfo> registrations;
+    registrations.reserve(requests.size());
+    for (const auto &request : requests) {
+        registrations.push_back({request.dev, request.inode, request.offset_range,
+            std::string{request.symbol}, request.callback, request.backup,
+            request.operation, request.expected_current});
+    }
+    lsplt::HookBatchReport report;
+    report.success = ExecuteRequests(cached, registrations, &report.results,
+                                    &report.recoveries, report.error_number);
+    report.rollback_pending = bool(pending_rollback);
+    return report;
+}
+
 }  // namespace
 
 namespace lsplt {
@@ -707,11 +849,21 @@ inline namespace v2 {
     return report;
 }
 
+[[maybe_unused]] HookBatchReport ApplyHooksDetailed(const std::vector<HookRequest> &requests) {
+    const std::unique_lock lock(hook_mutex);
+    return ApplyRequests(false, requests);
+}
+
+[[maybe_unused]] HookBatchReport ApplyHooksCachedDetailed(const std::vector<HookRequest> &requests) {
+    const std::unique_lock lock(hook_mutex);
+    return ApplyRequests(true, requests);
+}
+
 [[maybe_unused]] bool ReleaseInactiveCache() {
     const std::unique_lock lock(hook_mutex);
     if (!register_info.empty() || pending_rollback) return false;
     for (const auto &[address, info] : hook_info) {
-        if (info.backup || !info.hooks.empty()) return false;
+        if (info.backup || !info.hooks.empty() || !info.chains.empty()) return false;
     }
     hook_info.clear();
     std::vector<RegisterInfo>().swap(register_info);
